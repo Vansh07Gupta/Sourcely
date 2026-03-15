@@ -1,0 +1,54 @@
+services:
+  neo4j:
+    image: neo4j:latest
+    container_name: kg-rag-neo4j
+    ports:
+      - "7474:7474"  
+      - "7687:7687"  
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+      - NEO4J_PLUGINS='["apoc"]'
+    volumes:
+      - neo4j_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kg-rag-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /bin/ollama serve &
+        sleep 5
+        /bin/ollama pull ${OLLAMA_MODEL:-llama3.2}
+        wait
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kg-rag-app
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+
+volumes:
+  neo4j_data:
+  ollama_data:
