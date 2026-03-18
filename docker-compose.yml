@@ -7,7 +7,7 @@ services:
       - "7687:7687"  
     environment:
       - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
-      - NEO4J_PLUGINS='["apoc"]'
+      - NEO4J_PLUGINS=["apoc"]
     volumes:
       - neo4j_data:/data
     restart: unless-stopped
@@ -31,6 +31,7 @@ services:
         /bin/ollama serve &
         sleep 5
         /bin/ollama pull ${OLLAMA_MODEL:-llama3.2}
+        /bin/ollama pull ${OLLAMA_EMBED_MODEL:-nomic-embed-text}
         wait
 
   streamlit:

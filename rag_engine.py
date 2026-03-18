@@ -1,9 +1,17 @@
 import re
-from typing import Dict
+from typing import Dict, List
 
-from config import inference_client
+from langchain_core.messages import HumanMessage
+
+from config import get_chat_model
+from embeddings import cosine_similarity, embed_text
 from graph_store import Neo4jGraphStore
 from models import AttributedAnswer, SourceAttribution
+
+_SEED_TOP_K = 3
+_SEED_SIMILARITY_FLOOR = 0.3
+
+_NEIGHBOR_TOP_K = 8
 
 # Common words ignored when scoring claim/source overlap
 _STOPWORDS = {
@@ -14,13 +22,21 @@ _STOPWORDS = {
 }
 
 
+def _extract_citation_numbers(text: str) -> List[str]:
+
+    numbers = []
+    for group in re.findall(r'\[([\d,\s]+)\]', text):
+        numbers.extend(n.strip() for n in group.split(',') if n.strip().isdigit())
+    return numbers
+
+
 def _extract_claim_sentences(answer_text: str) -> Dict[str, str]:
     """Maps each citation key (e.g. '[1]') to the sentence that carries it."""
     claim_map = {}
     # Split answer into sentences, keeping citation markers attached
     sentences = re.split(r'(?<=[.!?])\s+', answer_text)
     for sentence in sentences:
-        for citation_num in re.findall(r'\[(\d+)\]', sentence):
+        for citation_num in _extract_citation_numbers(sentence):
             citation_key = f"[{citation_num}]"
             # Keep the first sentence found for each citation
             claim_map.setdefault(citation_key, sentence.strip())
@@ -28,16 +44,28 @@ def _extract_claim_sentences(answer_text: str) -> Dict[str, str]:
 
 
 def _score_claim_support(claim_text: str, source_text: str) -> float:
-    """Scores how well the source text supports the claim via keyword overlap."""
+
     def significant_words(text: str) -> set:
         words = set(re.findall(r'[a-z0-9]+', text.lower()))
         return {w for w in words if len(w) > 2 and w not in _STOPWORDS}
 
-    claim_words = significant_words(re.sub(r'\[\d+\]', '', claim_text))
+    clean_claim = re.sub(r'\[\d+\]', '', claim_text)
+    claim_words = significant_words(clean_claim)
     source_words = significant_words(source_text)
-    if not claim_words:
+    keyword_score = (len(claim_words & source_words) / len(claim_words)) if claim_words else None
+
+    try:
+        semantic_score = max(0.0, cosine_similarity(embed_text(clean_claim), embed_text(source_text)))
+    except Exception:
+        semantic_score = None  # embedding call failed: fall back to keyword-only
+
+    if keyword_score is None and semantic_score is None:
         return 0.0
-    return round(len(claim_words & source_words) / len(claim_words), 2)
+    if semantic_score is None:
+        return round(keyword_score, 2)
+    if keyword_score is None:
+        return round(semantic_score, 2)
+    return round((keyword_score + semantic_score) / 2, 2)
 
 
 def _normalize_citations(answer_text: str, valid_refs: set) -> str:
@@ -47,10 +75,6 @@ def _normalize_citations(answer_text: str, valid_refs: set) -> str:
             return f"[{number}]"
         return match.group(0)  # Not a known source: leave as-is
 
-    # Variants, most specific first:
-    #   (N 13) / (Source 13) / (Ref 13) / (Citation 13) / [Source 13]
-    #   Source 13 (bare, word-prefixed only — bare (13) needs the prefix or
-    #   parens to avoid mangling ordinary numbers in prose)
     patterns = [
         r'[\(\[]\s*(?:N|no\.?|source|ref(?:erence)?|citation)\s*(?P<num>\d+)\s*[\)\]]',
         r'\b(?:Source|Ref(?:erence)?|Citation)\s+(?P<num>\d+)\b',
@@ -70,25 +94,26 @@ def run_attributed_graph_rag(
     trace_steps = []
     attributions = []
 
-    trace_steps.append(f"🔎 Querying Neo4j Graph Index for: '{user_query}'")
-    query_terms = {
-        word.lower()
-        for word in re.findall(r"[A-Za-z0-9]+", user_query)
-        if len(word) > 2 and word.lower() not in _STOPWORDS
-    }
-    entity_terms = re.findall(
-        r"\b(?:[A-Z][a-z0-9]+(?:\s+[A-Z][a-z0-9]+)*)\b",
-        user_query
+    trace_steps.append(f"🔎 Embedding query and searching Neo4j Graph Index for: '{user_query}'")
+
+    all_nodes = graph_store.get_all_node_embeddings()
+    if not all_nodes:
+        return AttributedAnswer(
+            content="No matching nodes found in the knowledge graph to answer your query.",
+            sources=[],
+            execution_steps=trace_steps
+        )
+    query_embedding = embed_text(user_query)
+    scored_nodes = sorted(
+        (
+            (cosine_similarity(query_embedding, nb['embedding']), nb)
+            for nb in all_nodes if nb.get('embedding')
+        ),
+        key=lambda pair: pair[0],
+        reverse=True
     )
 
-    initial_matches = []
-    seen_node_names = set()
-
-    for term in [*entity_terms, *query_terms]:
-        for match in graph_store.query_nodes_by_text(term):
-            if match["name"] not in seen_node_names:
-                initial_matches.append(match)
-                seen_node_names.add(match["name"])
+    initial_matches = [nb for score, nb in scored_nodes[:_SEED_TOP_K] if score >= _SEED_SIMILARITY_FLOOR]
 
     if not initial_matches:
         return AttributedAnswer(
@@ -97,23 +122,35 @@ def run_attributed_graph_rag(
             execution_steps=trace_steps
         )
 
-    trace_steps.append(f"📊 Identified {len(initial_matches)} potential starting points")
+    top_score = scored_nodes[0][0]
+    trace_steps.append(f"📊 Identified {len(initial_matches)} potential starting points (top similarity: {top_score:.2f})")
 
     # Step 2: Multi-hop graph expansion
     combined_contexts = []
-    for match in initial_matches[:3]:
+    for match in initial_matches:
         trace_steps.append(f"🔗 Traversing paths from node: {match['name']}")
-        neighbors = graph_store.fetch_hops_context(match['name'], depth=2)
+        neighbors = graph_store.fetch_hops_context(match['node_id'], depth=2)
 
-        for nb in neighbors:
+        ranked_neighbors = sorted(
+            (
+                (cosine_similarity(query_embedding, nb['embedding']) if nb.get('embedding') else 0.0, nb)
+                for nb in neighbors
+            ),
+            key=lambda pair: pair[0],
+            reverse=True
+        )
+
+        for score, nb in ranked_neighbors[:_NEIGHBOR_TOP_K]:
+            doc_sources = nb.get('sources') or []
+            text_chunks = nb.get('chunks') or []
             combined_contexts.append({
                 "node_name": nb['name'],
                 "summary": nb['summary'],
-                "document": nb['source'],
-                "chunk": nb['chunk'],
+                "document": ", ".join(doc_sources) if doc_sources else "unknown",
+                "chunk": text_chunks[0] if text_chunks else "",
                 "relation_context": nb.get('path_contexts', [])
             })
-            trace_steps.append(f"  → Found connected element: {nb['name']}")
+            trace_steps.append(f"  → Found connected element: {nb['name']} (similarity: {score:.2f})")
 
     # Compile prompt content context with indexing map
     context_builder = []
@@ -144,6 +181,9 @@ def run_attributed_graph_rag(
     Citation rules:
     - Cite with square brackets and the source number only: [1], [2].
     - Do NOT use (1), (N 1), (Source 1), "Table 1", "Figure 1", or footnotes.
+    - If a sentence is supported by multiple sources, write each as its own
+      bracket right after another: [1][2][3]. Do NOT group them in one
+      bracket like [1, 2, 3].
     - Only cite numbers that appear in the RELATIONSHIP CONTEXT above.
     - Every factual sentence must end with at least one citation.
 
@@ -153,11 +193,9 @@ def run_attributed_graph_rag(
     """
 
     try:
-        response = inference_client.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        answer_text = response['message']['content']
+        chat_model = get_chat_model(model_name)
+        response = chat_model.invoke([HumanMessage(content=prompt)])
+        answer_text = response.content
         trace_steps.append("✅ Generated attributed text from local LLM")
 
         # Step 4: Normalize drifted citation formats, then trace and verify
@@ -168,7 +206,7 @@ def run_attributed_graph_rag(
             answer_text = normalized_text
 
         claim_sentences = _extract_claim_sentences(answer_text)
-        citations_found = re.findall(r'\[(\d+)\]', answer_text)
+        citations_found = _extract_citation_numbers(answer_text)
         for citation in sorted(set(citations_found), key=int):
             citation_key = f"[{citation}]"
             if citation_key in provenance_reference:

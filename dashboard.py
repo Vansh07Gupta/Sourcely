@@ -3,29 +3,79 @@ import streamlit as st
 from config import DEFAULT_MODEL, NEO4J_DEFAULT_PASSWORD, NEO4J_DEFAULT_URI, NEO4J_DEFAULT_USER
 from extractor import parse_graph_elements_via_llm
 from graph_store import Neo4jGraphStore
+from pdf_ingest import extract_pdf_chunks
 from rag_engine import run_attributed_graph_rag
+
+
+_STATUS_COLORS = {"good": "#0ca30c", "warning": "#fab219", "critical": "#d03b3b"}
+
+
+def _support_status(score: float):
+    if score >= 0.7:
+        return "🟢", "Strong support", _STATUS_COLORS["good"]
+    if score >= 0.4:
+        return "🟡", "Partial support", _STATUS_COLORS["warning"]
+    return "🔴", "Weak support", _STATUS_COLORS["critical"]
+
+
+def _inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        html, body, [class*="css"]  {
+            font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        [data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+        [data-testid="stMetricLabel"] { color: #52514e; }
+        hr { border-color: rgba(11, 11, 11, 0.10); }
+        .vg-header {
+            padding: 1.25rem 1.5rem;
+            border-radius: 10px;
+            background: #fcfcfb;
+            border: 1px solid rgba(11, 11, 11, 0.10);
+            margin-bottom: 1.25rem;
+        }
+        .vg-header h1 { margin: 0 0 0.25rem 0; font-size: 1.6rem; }
+        .vg-header p { margin: 0; color: #52514e; }
+        .vg-chip-row { display: flex; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+        .vg-chip {
+            font-size: 0.8rem;
+            padding: 0.25rem 0.65rem;
+            border-radius: 999px;
+            background: #f0efec;
+            color: #52514e;
+            border: 1px solid rgba(11, 11, 11, 0.10);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
 
 def main():
     st.set_page_config(
-        page_title="VeriGraph GraphRAG with Citations 🔍",
+        page_title="VeriGraph — GraphRAG with Citations",
         page_icon="🔍",
         layout="wide"
     )
+    _inject_custom_css()
 
+    st.sidebar.markdown("## 🔍 VeriGraph")
+    st.sidebar.caption("GraphRAG with verifiable citations")
     st.sidebar.divider()
-    st.sidebar.header("⚙️ Graph Configuration")
 
-    db_uri = st.sidebar.text_input("Neo4j Database URI", NEO4J_DEFAULT_URI)
-    db_user = st.sidebar.text_input("Neo4j Username", NEO4J_DEFAULT_USER)
-    db_pass = st.sidebar.text_input("Neo4j Password", type="password", value=NEO4J_DEFAULT_PASSWORD)
-    model_options = ["llama3.2", "mistral", "phi3"]
-    if DEFAULT_MODEL not in model_options:
-        model_options.insert(0, DEFAULT_MODEL)
-    model_choice = st.sidebar.selectbox(
-        "Local Inference Model", model_options,
-        index=model_options.index(DEFAULT_MODEL)
-    )
+    with st.sidebar.container(border=True):
+        st.markdown("**Graph Configuration**")
+        db_uri = st.text_input("Neo4j Database URI", NEO4J_DEFAULT_URI)
+        db_user = st.text_input("Neo4j Username", NEO4J_DEFAULT_USER)
+        db_pass = st.text_input("Neo4j Password", type="password", value=NEO4J_DEFAULT_PASSWORD)
+        model_options = ["llama3.2", "mistral", "phi3"]
+        if DEFAULT_MODEL not in model_options:
+            model_options.insert(0, DEFAULT_MODEL)
+        model_choice = st.selectbox(
+            "Local Inference Model", model_options,
+            index=model_options.index(DEFAULT_MODEL)
+        )
 
     if 'has_nodes' not in st.session_state:
         st.session_state.has_nodes = False
@@ -38,82 +88,129 @@ def main():
                 st.session_state.has_nodes = True
                 st.session_state.processed_docs = persisted_docs
         except Exception:
-            # Neo4j offline or unreachable — fall back to empty state silently
             pass
 
-    # History of query runs, consumed by the Trace Logs route
     if 'trace_history' not in st.session_state:
         st.session_state.trace_history = []
 
     def dashboard_page():
-        st.title("🔍  VeriGraph with Citations")
-        st.divider()
-
-        st.markdown("""
-        This system implements **Knowledge Graph-based Retrieval-Augmented Generation (GraphRAG)**:
-        - **Multi-hop reasoning**: Traverses interconnected elements across different source files.
-        - **Citations Provenance**: Traces and validates every statement back to source chunks.
-        - **Audit Trails**: Clear logs of traversal paths and search steps.
-        """)
+        st.markdown(
+            """
+            <div class="vg-header">
+              <h1>🔍 VeriGraph</h1>
+              <p>Knowledge Graph-based GraphRAG: multi-hop reasoning with traceable, verifiable citations.</p>
+              <div class="vg-chip-row">
+                <span class="vg-chip">Multi-hop reasoning</span>
+                <span class="vg-chip">Citation provenance</span>
+                <span class="vg-chip">Audit trails</span>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         tab_docs, tab_query, tab_viz = st.tabs(["📄 Document Ingestion", "❓ Ask Assistant", "🔬 Database Status"])
 
         with tab_docs:
             st.header("1. Extract Knowledge Graph elements")
 
-            demo_documents = {
-                "Helios Platform Specification": """
-                Helios is a renewable energy analytics platform developed by Meridian Dynamics. It
-                aggregates telemetry from solar farms and wind installations to forecast grid output.
-                The platform was architected by Dr. Elena Vasquez, who leads the data science team
-                in Austin. Helios integrates with TimescaleDB to store time-series readings and
-                publishes daily capacity forecasts to regional grid operators.
-                """,
-                "Meridian Dynamics Company Overview": """
-                Meridian Dynamics was founded in 2019 as a climate technology startup. The company
-                is backed by GreenField Ventures, who led a $25 million Series B round. Their flagship
-                product is Helios, an energy forecasting engine. The Helios team includes engineers
-                previously at the National Renewable Energy Laboratory and Siemens, working under the
-                technical leadership of Dr. Elena Vasquez.
-                """
-            }
-
-            selected_template = st.selectbox("Select document template:", list(demo_documents.keys()))
-            document_payload = st.text_area("Input Document Text:", demo_documents[selected_template], height=200)
-            user_doc_name = st.text_input("Specify Document Label:", selected_template)
+            document_payload = st.text_area("Input Document Text:", "", height=200, placeholder="Paste any document text here...")
+            user_doc_name = st.text_input("Specify Document Label:", "")
 
             if st.button("🔨 Extract & Ingest Nodes"):
-                with st.spinner("Extracting elements and relationships using LLM..."):
+                if not document_payload.strip():
+                    st.warning("Please enter some document text before extracting.")
+                elif not user_doc_name.strip():
+                    st.warning("Please specify a document label.")
+                else:
+                    with st.spinner("Extracting elements and relationships using LLM..."):
+                        try:
+                            store = Neo4jGraphStore(db_uri, db_user, db_pass)
+                            existing_entities = store.get_all_entity_name_embeddings()
+                            extracted_nodes, extracted_edges = parse_graph_elements_via_llm(
+                                document_payload, user_doc_name, model_choice, existing_entities=existing_entities
+                            )
+
+                            for node in extracted_nodes:
+                                store.insert_node(node)
+
+                            for edge in extracted_edges:
+                                store.insert_edge(edge)
+
+                            store.shutdown()
+
+                            st.success(f"Successfully loaded {len(extracted_nodes)} entities and {len(extracted_edges)} relationships.")
+
+                            with st.expander("Ingested Entities Details"):
+                                for en in extracted_nodes:
+                                    st.write(f"🔹 **{en.display_name}** ({en.category}): {en.summary}")
+
+                            with st.expander("Ingested Relationships Details"):
+                                for rel in extracted_edges:
+                                    st.write(f"🔗 {rel.source_node} --[{rel.edge_type}]--> {rel.target_node}: {rel.context}")
+
+                            st.session_state.has_nodes = True
+                            if user_doc_name not in st.session_state.processed_docs:
+                                st.session_state.processed_docs.append(user_doc_name)
+
+                        except Exception as ex:
+                            st.error(f"Failed to ingest: {ex}")
+                            st.info("Ensure Neo4j is online and active, and both the chat and embedding Ollama models (ollama pull llama3.2, ollama pull nomic-embed-text) are downloaded.")
+
+            st.divider()
+            st.subheader("Or upload a PDF")
+
+            uploaded_pdf = st.file_uploader("Upload a PDF document", type=["pdf"])
+
+            if uploaded_pdf is not None and st.button("📄 Extract & Ingest PDF"):
+                try:
+                    pdf_chunks = extract_pdf_chunks(uploaded_pdf)
+                except Exception as ex:
+                    st.error(f"Failed to read PDF: {ex}")
+                    pdf_chunks = []
+
+                if uploaded_pdf is not None and not pdf_chunks:
+                    st.warning("No extractable text found in this PDF (it may be scanned/image-only).")
+
+                if pdf_chunks:
+                    progress_bar = st.progress(0.0, text=f"Processing 0/{len(pdf_chunks)} chunks...")
+                    total_nodes, total_edges = 0, 0
+                    store = Neo4jGraphStore(db_uri, db_user, db_pass)
                     try:
-                        # Ingest extracted entities and edges to active graph
-                        store = Neo4jGraphStore(db_uri, db_user, db_pass)
-                        extracted_nodes, extracted_edges = parse_graph_elements_via_llm(document_payload, user_doc_name, model_choice)
+                        for idx, (chunk_label, chunk_text) in enumerate(pdf_chunks):
+                            doc_label = f"{uploaded_pdf.name} ({chunk_label})"
+                            # Re-fetched each chunk so entities inserted by
+                            # earlier chunks (this upload or prior ones) are
+                            # available for semantic resolution.
+                            existing_entities = store.get_all_entity_name_embeddings()
+                            extracted_nodes, extracted_edges = parse_graph_elements_via_llm(
+                                chunk_text, doc_label, model_choice, existing_entities=existing_entities
+                            )
 
-                        for node in extracted_nodes:
-                            store.insert_node(node)
+                            for node in extracted_nodes:
+                                store.insert_node(node)
+                            for edge in extracted_edges:
+                                store.insert_edge(edge)
 
-                        for edge in extracted_edges:
-                            store.insert_edge(edge)
+                            total_nodes += len(extracted_nodes)
+                            total_edges += len(extracted_edges)
+                            progress_bar.progress(
+                                (idx + 1) / len(pdf_chunks),
+                                text=f"Processing {idx + 1}/{len(pdf_chunks)} chunks..."
+                            )
 
-                        store.shutdown()
-
-                        st.success(f"Successfully loaded {len(extracted_nodes)} entities and {len(extracted_edges)} relationships.")
-
-                        with st.expander("Ingested Entities Details"):
-                            for en in extracted_nodes:
-                                st.write(f"🔹 **{en.display_name}** ({en.category}): {en.summary}")
-
-                        with st.expander("Ingested Relationships Details"):
-                            for rel in extracted_edges:
-                                st.write(f"🔗 {rel.source_node} --[{rel.edge_type}]--> {rel.target_node}: {rel.context}")
-
+                        st.success(
+                            f"Ingested {uploaded_pdf.name}: {len(pdf_chunks)} chunks, "
+                            f"{total_nodes} entity mentions, {total_edges} relationships."
+                        )
                         st.session_state.has_nodes = True
-                        if user_doc_name not in st.session_state.processed_docs:
-                            st.session_state.processed_docs.append(user_doc_name)
-
+                        if uploaded_pdf.name not in st.session_state.processed_docs:
+                            st.session_state.processed_docs.append(uploaded_pdf.name)
                     except Exception as ex:
-                        st.error(f"Failed to ingest: {ex}")
-                        st.info("Ensure Neo4j is online and active, and the Ollama model is downloaded.")
+                        st.error(f"Failed to ingest PDF: {ex}")
+                        st.info("Ensure Neo4j is online and active, and both the chat and embedding Ollama models (ollama pull llama3.2, ollama pull nomic-embed-text) are downloaded.")
+                    finally:
+                        store.shutdown()
 
         with tab_query:
             st.header("2. Attributed Query Search")
@@ -123,7 +220,7 @@ def main():
             else:
                 st.info(f"Loaded Indexes: {', '.join(st.session_state.processed_docs)}")
 
-            user_query = st.text_input("Enter Question:", "What are the core components of Helios and who leads the development?")
+            user_query = st.text_input("Enter Question:", "", placeholder="Ask a question about your ingested documents...")
 
             if st.button("🔎 Search Attributed Answer"):
                 with st.spinner("Traversing graph and resolving query..."):
@@ -146,11 +243,17 @@ def main():
                         st.subheader("📚 Source Attributions")
                         if rag_result.sources:
                             for idx, source in enumerate(rag_result.sources):
-                                with st.expander(f"Source [{idx+1}]: {source.doc_source} (support: {source.score:.0%})"):
+                                icon, status_label, color = _support_status(source.score)
+                                with st.expander(f"{icon} Source [{idx+1}]: {source.doc_source} — {source.score:.0%} support"):
                                     st.write(f"**Cited Claim:** {source.claim_text}")
                                     st.write(f"**Document Name:** {source.doc_source}")
                                     st.write(f"**Context Text:** {source.reference_text}")
-                                    st.write(f"**Support Score:** {source.score:.0%} keyword overlap with source")
+                                    st.markdown(
+                                        f"**Support Score:** {icon} "
+                                        f"<span style='color:{color}; font-weight:600'>{source.score:.0%} — {status_label}</span> "
+                                        f"(keyword overlap + semantic similarity with source)",
+                                        unsafe_allow_html=True
+                                    )
                                     st.write(f"**Reasoning Trace:** {' ➔ '.join(source.path_trace)}")
                         else:
                             st.info("No specific verifiable sources matched this answer.")
@@ -169,9 +272,10 @@ def main():
                         total_nodes = sess.run("MATCH (n) RETURN count(n) as cnt").single()['cnt']
                         total_edges = sess.run("MATCH ()-[r]->() RETURN count(r) as cnt").single()['cnt']
 
-                    col_left, col_right = st.columns(2)
-                    col_left.metric("Total Nodes", total_nodes)
-                    col_right.metric("Total Edges", total_edges)
+                    with st.container(border=True):
+                        col_left, col_right = st.columns(2)
+                        col_left.metric("Total Nodes", total_nodes)
+                        col_right.metric("Total Edges", total_edges)
                     store.shutdown()
                 except Exception as ex:
                     st.error(f"Could not connect: {ex}")

@@ -1,20 +1,33 @@
-import hashlib
-import json
-from typing import List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import streamlit as st
+from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import JsonOutputParser
 
-from config import inference_client
-from models import GraphEdge, GraphNode
+from config import get_chat_model
+from embeddings import cosine_similarity, embed_text
+from models import GraphEdge, GraphNode, compute_node_id
+
+_SEMANTIC_MATCH_THRESHOLD = 0.88
+
+
+def _semantic_match(candidate_embedding: List[float], pool: List[Dict]) -> Optional[str]:
+
+    best_name, best_score = None, 0.0
+    for entity in pool:
+        score = cosine_similarity(candidate_embedding, entity["embedding"])
+        if score > best_score:
+            best_name, best_score = entity["name"], score
+    return best_name if best_score >= _SEMANTIC_MATCH_THRESHOLD else None
 
 
 def parse_graph_elements_via_llm(
     document_content: str,
     document_name: str,
-    model_name: str = "llama3.2"
+    model_name: str = "llama3.2",
+    existing_entities: Optional[Iterable[Dict]] = None
 ) -> Tuple[List[GraphNode], List[GraphEdge]]:
-
-    # Structural extraction prompt formatting
+    existing_pool = list(existing_entities or [])
     extraction_prompt = f"""You are a structural parser. Extract core entities and
 explicit relationships from the text.
 
@@ -46,38 +59,34 @@ Text to analyze:
 """
 
     try:
-        completion = inference_client.chat(
-            model=model_name,
-            messages=[{"role": "user", "content": extraction_prompt}],
-            format="json"
-        )
-
-        parsed_data = json.loads(completion["message"]["content"])
+        chat_model = get_chat_model(model_name, json_mode=True)
+        completion = chat_model.invoke([HumanMessage(content=extraction_prompt)])
+        parsed_data = JsonOutputParser().parse(completion.content)
 
         node_list = []
+        local_pool: List[Dict] = []
         skipped_nodes = 0
         for nd in parsed_data.get("nodes", []):
-            # LLM output is untrusted: fields may be missing or renamed.
-            # Require a name; default everything else.
             if not isinstance(nd, dict) or not nd.get("name"):
                 skipped_nodes += 1
                 continue
 
-            # Generate stable md5 hash as node_id
-            unique_hash = hashlib.md5(
-                f"{nd['name']}_{document_name}".encode()
-            ).hexdigest()[:12]
+            raw_name = nd["name"]
+            name_embedding = embed_text(raw_name)
+            canonical_name = _semantic_match(name_embedding, existing_pool) or raw_name
+            unique_hash = compute_node_id(canonical_name)
 
             node_list.append(
                 GraphNode(
                     node_id=unique_hash,
-                    display_name=nd["name"],
+                    display_name=canonical_name,
                     category=nd.get("type", "CONCEPT"),
                     summary=nd.get("summary") or nd.get("description", ""),
                     origin_document=document_name,
                     text_snippet=document_content[:250] + "..."
                 )
             )
+            local_pool.append({"name": canonical_name, "embedding": name_embedding})
 
         edge_list = []
         skipped_edges = 0
@@ -103,29 +112,24 @@ Text to analyze:
             )
 
         known_names = {n.display_name for n in node_list}
+        existing_names = {e["name"] for e in existing_pool}
 
         def resolve_endpoint(raw_name: str) -> str:
             if raw_name in known_names:
                 return raw_name
-            # Case-insensitive exact match
-            for name in known_names:
-                if name.lower() == raw_name.lower():
-                    return name
-            for name in known_names:
-                if raw_name.lower() in name.lower() or name.lower() in raw_name.lower():
-                    return name
-            return raw_name  # No match: keep as-is, stub node created below
+            endpoint_embedding = embed_text(raw_name)
+            return (
+                _semantic_match(endpoint_embedding, local_pool)
+                or _semantic_match(endpoint_embedding, existing_pool)
+                or raw_name
+            )
 
         for edge in edge_list:
             edge.source_node = resolve_endpoint(edge.source_node)
             edge.target_node = resolve_endpoint(edge.target_node)
-
-            # Create stub nodes for endpoints the LLM never emitted as nodes
             for endpoint in (edge.source_node, edge.target_node):
-                if endpoint not in known_names:
-                    stub_hash = hashlib.md5(
-                        f"{endpoint}_{document_name}".encode()
-                    ).hexdigest()[:12]
+                if endpoint not in known_names and endpoint not in existing_names:
+                    stub_hash = compute_node_id(endpoint)
                     node_list.append(
                         GraphNode(
                             node_id=stub_hash,

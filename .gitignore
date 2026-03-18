@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .streamlit/secrets.toml
 fixes.md
+prep.md
+architecture.md
+eval_data
+.streamlit
+.claude
+
