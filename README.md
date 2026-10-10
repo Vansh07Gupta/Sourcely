@@ -1,4 +1,4 @@
-# 🔍 VeriGraph — GraphRAG with Verifiable Citations
+# 🔍 Sourcely — GraphRAG with Verifiable Citations
 
 A Knowledge Graph-based Retrieval-Augmented Generation (GraphRAG) system. It extracts entities and relationships from your documents into a Neo4j graph, answers questions by traversing that graph across multiple hops, and attaches a scored, verifiable citation to every claim in its answer — flagging citations that don't actually trace back to a real source. All inference runs locally through Ollama; nothing is sent to an external API.
 
